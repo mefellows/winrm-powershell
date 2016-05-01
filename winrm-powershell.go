@@ -2,15 +2,19 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"flag"
 	"fmt"
-	"github.com/masterzen/winrm/winrm"
-	"github.com/mitchellh/packer/packer"
-	"github.com/packer-community/winrmcp/winrmcp"
 	"io/ioutil"
+	"log"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/masterzen/winrm/winrm"
+	"github.com/mitchellh/packer/common/uuid"
+	"github.com/packer-community/winrmcp/winrmcp"
 )
 
 var (
@@ -34,12 +38,12 @@ func main() {
 	flag.BoolVar(&elevated, "elevated", false, "run as elevated user?")
 	flag.Parse()
 
-	cmd = winrm.Powershell(flag.Arg(0))
-	client = winrm.NewClientWithParameters(&winrm.Endpoint{hostname, port}, user, pass, winrm.NewParameters(timeout, "en-US", 153600))
-	var err error
+	cmd = flag.Arg(0)
+
+	client, err := winrm.NewClientWithParameters(&winrm.Endpoint{Host: hostname, Port: port, HTTPS: false, Insecure: true, CACert: nil}, user, pass, winrm.NewParameters(timeout, "en-US", 153600))
 
 	if !elevated {
-		err = client.RunWithInput(cmd, os.Stdout, os.Stderr, os.Stdin)
+		_, err = client.RunWithInput(winrm.Powershell(cmd), os.Stdout, os.Stderr, os.Stdin)
 	} else {
 		err = StartElevated()
 	}
@@ -59,21 +63,12 @@ type elevatedShellOptions struct {
 }
 
 func StartElevated() (err error) {
-	// Wrap the command in scheduled task
-	tpl, err := packer.NewConfigTemplate()
-	if err != nil {
-		return err
-	}
-
 	// The command gets put into an interpolated string in the PS script,
 	// so we need to escape any embedded quotes.
-	escapedCmd := strings.Replace(cmd, "\"", "`\"", -1)
+	cmd = strings.Replace(cmd, "\"", "`\"", -1)
 
-	elevatedScript, err := tpl.Process(ElevatedShellTemplate, &elevatedShellOptions{
-		Command:  escapedCmd,
-		User:     user,
-		Password: pass,
-	})
+	elevatedScript, err := createCommandText()
+
 	if err != nil {
 		return err
 	}
@@ -85,6 +80,7 @@ func StartElevated() (err error) {
 		MaxOperationsPerShell: 15,
 	})
 	tmpFile, err := ioutil.TempFile(os.TempDir(), "packer-elevated-shell.ps1")
+	fmt.Printf("Temp file: %s", tmpFile.Name())
 	writer := bufio.NewWriter(tmpFile)
 	if _, err := writer.WriteString(elevatedScript); err != nil {
 		return fmt.Errorf("Error preparing shell script: %s", err)
@@ -96,110 +92,55 @@ func StartElevated() (err error) {
 
 	tmpFile.Close()
 
-	err = winrmcp.Copy(tmpFile.Name(), "$env:TEMP/packer-elevated-shell.ps1")
+	err = winrmcp.Copy(tmpFile.Name(), "${env:TEMP}/packer-elevated-shell.ps1")
 
 	if err != nil {
+		fmt.Printf("Error copying shell script: %s", err)
 		return err
 	}
 
 	// Run the script that was uploaded
-	command := fmt.Sprintf("powershell -executionpolicy bypass -file \"%s\"", "%TEMP%/packer-elevated-shell.ps1")
-	err = client.RunWithInput(command, os.Stdout, os.Stderr, os.Stdin)
+	command := fmt.Sprintf("powershell -executionpolicy bypass -file \"%s\"", "%TEMP%\\packer-elevated-shell.ps1")
+	fmt.Printf("Running script: %s", command)
+	client, err = winrm.NewClientWithParameters(&winrm.Endpoint{Host: hostname, Port: port, HTTPS: false, Insecure: true, CACert: nil}, user, pass, winrm.NewParameters(timeout, "en-US", 153600))
+	_, err = client.RunWithInput(command, os.Stdout, os.Stderr, os.Stdin)
 	return err
 }
 
-const ElevatedShellTemplate = `
-$command = "{{.Command}}" + '; exit $LASTEXITCODE'
-$user = '{{.User}}'
-$password = '{{.Password}}'
+func createCommandText() (command string, err error) {
 
-$task_name = "packer-elevated-shell"
-$out_file = "$env:TEMP\packer-elevated-shell.log"
+	// doesn't take well to the flattened env vars
+	cmd = fmt.Sprintf(`$env:FOO="bar"; %s`, cmd)
 
-if (Test-Path $out_file) {
-  del $out_file
+	log.Printf("Building elevated command for: %s", cmd)
+
+	// generate command
+	var buffer bytes.Buffer
+	err = elevatedTemplate.Execute(&buffer, elevatedOptions{
+		User:            user,
+		Password:        pass,
+		TaskDescription: "Packer elevated task",
+		TaskName:        fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID()),
+		EncodedCommand:  powershellEncode([]byte(cmd + "; exit $LASTEXITCODE")),
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	log.Printf("ELEVATED SCRIPT: %s\n\n", string(buffer.Bytes()))
+	return string(buffer.Bytes()), nil
+
 }
 
-$task_xml = @'
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>Password</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>true</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
-    <Priority>4</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>cmd</Command>
-      <Arguments>{arguments}</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-'@
+func powershellEncode(buffer []byte) string {
+	// 2 byte chars to make PowerShell happy
+	wideCmd := ""
+	for _, b := range buffer {
+		wideCmd += string(b) + "\x00"
+	}
 
-$bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
-$encoded_command = [Convert]::ToBase64String($bytes)
-$arguments = "/c powershell.exe -EncodedCommand $encoded_command &gt; $out_file 2&gt;&amp;1"
-
-$task_xml = $task_xml.Replace("{arguments}", $arguments)
-$task_xml = $task_xml.Replace("{user}", $user)
-
-$schedule = New-Object -ComObject "Schedule.Service"
-$schedule.Connect()
-$task = $schedule.NewTask($null)
-$task.XmlText = $task_xml
-$folder = $schedule.GetFolder("\")
-$folder.RegisterTaskDefinition($task_name, $task, 6, $user, $password, 1, $null) | Out-Null
-
-$registered_task = $folder.GetTask("\$task_name")
-$registered_task.Run($null) | Out-Null
-
-$timeout = 10
-$sec = 0
-while ( (!($registered_task.state -eq 4)) -and ($sec -lt $timeout) ) {
-  Start-Sleep -s 1
-  $sec++
+	// Base64 encode the command
+	input := []uint8(wideCmd)
+	return base64.StdEncoding.EncodeToString(input)
 }
-
-function SlurpOutput($out_file, $cur_line) {
-  if (Test-Path $out_file) {
-    get-content $out_file | select -skip $cur_line | ForEach {
-      $cur_line += 1
-      Write-Host "$_" 
-    }
-  }
-  return $cur_line
-}
-
-$cur_line = 0
-do {
-  Start-Sleep -m 100
-  $cur_line = SlurpOutput $out_file $cur_line
-} while (!($registered_task.state -eq 3))
-
-$exit_code = $registered_task.LastTaskResult
-[System.Runtime.Interopservices.Marshal]::ReleaseComObject($schedule) | Out-Null
-
-exit $exit_code
-`
